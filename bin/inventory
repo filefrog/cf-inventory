@@ -1,0 +1,173 @@
+#!/usr/bin/env perl
+# vim:ft=perl
+use strict;
+use warnings;
+
+use LWP::UserAgent;
+use HTTP::Request;
+use JSON qw/decode_json encode_json/;
+use YAML qw/Dump/;
+
+$SIG{INT} = sub {
+	print "\ncaught SIGINT; terminating...\n";
+	exit 1;
+};
+
+sub maybe_json {
+	return decode_json(@_);
+}
+
+sub nap {
+	sleep($ENV{NAP_TIME} || 1);
+}
+
+my $UA = LWP::UserAgent->new( agent => 'starkandwayne-inventory-bot/1.0' );
+my $URL = $ENV{CF_API_ENDPOINT}
+	or die "Missing required \$CF_API_ENDPOINT environment variable\n";
+my $TOKEN = $ENV{CF_OAUTH_TOKEN}
+	or die "Missing required \$CF_OAUTH_TOKEN environment variable\n";
+$TOKEN =~ s/^bearer //i;
+
+sub GET {
+	my ($url) = @_;
+	if ($url !~ m/https?:/) {
+		$url =~ s|^/||;
+		$url = "$URL/$url";
+	}
+
+	my $req = HTTP::Request->new(GET => $url);
+	$req->header(Authorization => "bearer $TOKEN");
+	$req->header(Accept => 'application/json');
+	if ($ENV{DEBUG}) {
+		print STDERR "------<< GET $url\n";
+		print STDERR $req->as_string."\n\n";
+		print STDERR "------>> response:\n\n";
+	}
+	my $res = $UA->request($req);
+	if ($ENV{DEBUG}) {
+		print STDERR $res->as_string. "\n\n";
+		print STDERR "------\n\n";
+	}
+
+	nap();
+	if ($res->is_success) {
+		return maybe_json($res->decoded_content), 1;
+	}
+	return undef, 0;
+}
+
+sub GETEACH {
+	my ($url, $fn) = @_;
+
+	my $n = 0;
+	do {
+		my ($res, $ok) = GET($url);
+		if (!$ok) {
+			return 0;
+		}
+		for (@{$res->{resources}}) {
+			$fn->($_, $n);
+			$n++;
+		}
+		$url = $res->{pagination}{next}{href};
+	} while($url);
+	return 1;
+}
+
+sub GETALL {
+	my ($url) = @_;
+
+	my @all;
+	my $ok = GETEACH($url, sub { push @all, $_[0]; });
+	return \@all, $ok;
+}
+
+sub filter {
+	my ($obj, @attrs) = @_;
+	return map { $_ => $obj->{$_} } @attrs;
+}
+
+sub bools {
+	my ($obj, @attrs) = @_;
+	return map { $_ => $obj->{$_} ? 1 : 0 } @attrs;
+}
+
+my $file = $ARGV[0] || 'inventory.yml';
+print STDERR "cf-inventory: starting dump of $ENV{CF_API_ENDPOINT} to $file...\n";
+if (-f $file) {
+	print STDERR "$file: already exists; cowardly refusing to overwrite...\n";
+	exit 1;
+}
+open my $fh, ">", ($ARGV[0] || 'inventory.yml')
+	or die "unable to to open $file: $!\n";
+
+my %INV;
+GETEACH("/v3/organizations", sub {
+	my ($org) = @_;
+	print STDERR ">> processing org $org->{name}...\n";
+	$INV{orgs}{$org->{guid}} = {
+		filter($org, qw/guid name/),
+		bools($org, qw/suspended/)
+	};
+});
+
+GETEACH("/v3/spaces", sub {
+	my ($space) = @_;
+
+
+	my $org = $space->{relationships}{organization}{data}{guid};
+	print STDERR ">> processing org $INV{orgs}{$org}{name} space $space->{name}...\n";
+
+	my ($ssh, undef) = GET("/v3/spaces/$space->{guid}/features/ssh");
+	$INV{spaces}{$space->{guid}} = $org;
+	$INV{orgs}{$org}{spaces}{$space->{guid}} = {
+		features => { ssh => $ssh },
+		filter($space, qw/guid name/)
+	};
+});
+
+GETEACH("/v3/apps", sub {
+	my ($app) = @_;
+	my $space = $app->{relationships}{space}{data}{guid};
+	my $org = $INV{spaces}{$space};
+	print STDERR ">> processing org $INV{orgs}{$org}{name} space $INV{orgs}{$org}{spaces}{$space}{name} app $app->{name}...\n";
+
+	my ($env, undef) = GET("/v3/apps/$app->{guid}/env");
+	$INV{orgs}{$org}{spaces}{$space}{apps}{$app->{guid}} = {
+		env => $env || {},
+		filter($app, qw/guid name state lifecycle/)
+	};
+});
+
+GETEACH("/v3/buildpacks", sub {
+	my ($buildpack) = @_;
+	$INV{buildpacks}{$buildpack->{guid}} = {
+		filter($buildpack, qw/guid name state filename stack position enabled locked/),
+		bools($buildpack, qw/enabled locked/)
+	};
+});
+
+GETEACH("/v3/service_instances", sub {
+	my ($si) = @_;
+	my $space = $si->{relationships}{space}{data}{guid};
+	my $org = $INV{spaces}{$space};
+	$INV{orgs}{$org}{spaces}{$space}{services}{$si->{guid}} = {
+		filter($si, qw/guid name type tags syslog_drain_url route_service_url dashboard_url/)
+	};
+	if ($si->{relationships}{service_plan}{data}{guid}) {
+		$INV{orgs}{$org}{spaces}{$space}{services}{$si->{guid}}{service_plan} = $si->{relationships}{service_plan}{data}{guid};
+	}
+});
+
+GETEACH("/v3/stacks", sub {
+	my ($stack) = @_;
+	$INV{stacks}{$stack->{guid}} = {
+		filter($stack, qw/guid name description/)
+	};
+});
+
+delete $INV{spaces};
+
+print $fh Dump(\%INV);
+close $fh;
+exit 0;
