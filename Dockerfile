@@ -1,5 +1,12 @@
 FROM perl:5.30
 
+LABEL maintainer="James Hunt <images@huntprod.com>" \
+      summary="Cloud Foundry Inventory" \
+      org.label-schema.build-date=$BUILD_DATE \
+      org.label-schema.vcs-url="https://github.com/filefrog/cf-inventory.git" \
+      org.label-schema.vcs-ref=$VCS_REF \
+      org.label-schema.schema-version="1.0.0"
+
 RUN cpanm \
  LWP::Protocol::https \
  LWP::UserAgent \
