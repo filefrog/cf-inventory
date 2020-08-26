@@ -48,7 +48,7 @@ locally, you can instead use:
 
 If you want to tag it to your own Dockerhub username:
 
-    IMAGE=you-at-dockerhub/linode make build push
+    IMAGE=you-at-dockerhub/cf-inventory make build push
 
 By default, the image is tagged `latest`.  You can supply your own
 tag via the `TAG` environment variable:
